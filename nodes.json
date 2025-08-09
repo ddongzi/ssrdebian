@@ -1,0 +1,31 @@
+[
+    {
+        "weight": 1754631223,
+        "alterId": "",
+        "title": "CoffeeCloud",
+        "link": "",
+        "host": "https:\/\/45.137.180.232\/api\/v1\/client\/subscribe?token=6bf66d4a0d5d0fa046417227cd103136&flag=shadowrocket",
+        "file": "",
+        "filter": "",
+        "downmbps": "",
+        "alpn": "",
+        "uuid": "2B8CBB61-34DF-4FD5-84E8-EACFD2F45304",
+        "chain": "",
+        "flag": "WW",
+        "obfs": "none",
+        "method": "",
+        "updated": 1754670831.797087,
+        "type": "Subscribe",
+        "cert": "",
+        "plugin": "none",
+        "user": "",
+        "upmbps": "",
+        "protoParam": "",
+        "proto": "none",
+        "peer": "",
+        "password": "",
+        "data": "🚀↑:0.48GB,↓:23.73GB,TOT:130GB💡Expires:2025-09-20",
+        "obfsParam": "",
+        "created": 1754631223.7008131
+    }
+]
