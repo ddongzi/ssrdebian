@@ -2,49 +2,22 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QListWidget,
     QStackedWidget, QLabel, QHBoxLayout, QPushButton, QComboBox, QMessageBox,
     QLineEdit, QFormLayout, QDialogButtonBox, QDialog, QTreeWidget,
-    QTreeWidgetItem, QCheckBox, QGroupBox
+    QTreeWidgetItem, QCheckBox, QGroupBox, QMenu
 )
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal, QMutex
+from PySide6.QtGui import QPixmap, QImage
+import qrcode
+from io import BytesIO
+# from PIL import Image
 import threading
 import json
 import base64
 import urllib.parse
 import subprocess
+
 import re
 import requests
-
-class InsideProxy(QObject):
-
-    def __init__(self):
-        super().__init__()
-        self.proxy_host = '127.0.0.1'
-        self.proxy_port = 1080
-        self.proxies = {
-           "http": f"socks5h://{self.proxy_host}:{self.proxy_port}",
-            "https": f"socks5h://{self.proxy_host}:{self.proxy_port}"
-        }
-
-    def test_shadowsocks_proxy(self, test_url="https://www.google.com"):
-        e, res = self.get(test_url)
-        print('test proxy', e, res)
-        if  e:
-            return False
-        if res.status_code == 200:
-            return True
-        else:
-            return False
-    def get(self, url):
-        try:
-            print(self.proxies)
-            response = requests.get(url=url, proxies=self.proxies, timeout=5)
-            if response.status_code == 200:
-                return None, response
-            else:
-                return None, response
-        except Exception as e:
-            print(f"代理测试异常: {e}")
-            return e, None
-
+from urllib.parse import urlparse
 # ss://
 # Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo1NzQ1MDJkMS01Y2FlLTQ0ODMtYTQ1Ny03ZmFkMjRmMjg3Y2M
 # @v1abc123.sched.sma-dk.hfifx.xin:40060
@@ -135,13 +108,19 @@ class SSLocalLogReader(QObject):
 
             else:
                 print("格式不匹配")
-        
+  
 class SS(QObject):
     def __init__(self):
         super().__init__()
         self.proc = None
         self.thread = None
         self.running = False
+        self.proxy_host = '127.0.0.1'
+        self.proxy_port = 1080
+        self.proxies = {
+           "http": f"socks5h://{self.proxy_host}:{self.proxy_port}",
+            "https": f"socks5h://{self.proxy_host}:{self.proxy_port}"
+        }
 
     def start_ss(self, ss_link):
         ss_info = parse_ss_link(ss_link)
@@ -165,8 +144,10 @@ class SS(QObject):
         self.log_worker.moveToThread(self.thread)
         self.thread.started.connect(self.log_worker.run)
         self.thread.start()
+        self.running = True
 
     def stop_ss(self):
+        self.running = False
         if self.proc:
             self.proc.terminate()
             self.proc.wait()
@@ -177,6 +158,41 @@ class SS(QObject):
                 self.thread.wait()    # 等待线程退出
             print("Shadowsocks 已停止")
 
+    def test_shadowsocks_proxy(self, test_url="https://www.google.com"):
+        
+        e, res = self.get(test_url)
+        print('test proxy', e, res)
+        if  e:
+            return False
+        if res.status_code == 200:
+            return True
+        else:
+            return False
+    def get(self, url):
+        try:
+            if self.running:
+                response = requests.get(url=url, proxies=self.proxies, timeout=5)
+            else:
+                response = requests.get(url=url, proxies=None, timeout=5)
+            if response.status_code == 200:
+                return None, response
+            else:
+                return None, response
+        except Exception as e:
+            print(f"代理测试异常: {e}")
+            return e, None
+    
+    def add_node_2json(self, newnode):
+        # 读取 JSON 文件
+        with open("nodes.json", "r", encoding="utf-8") as f:
+            data = json.load(f)  # data 是一个 list
+
+        # 追加到数组
+        data.append(newnode)
+
+        # 写回文件
+        with open("nodes.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
 class EditParentNodeDialog(QDialog):
     def __init__(self, node_data=None):
@@ -309,7 +325,7 @@ class EditSubNodeDialog(QDialog):
 class SubscribeInputDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("输入订阅 URL")
+        self.setWindowTitle("输入subscribe, https:// or ss://")
         self.resize(400, 100)
 
         layout = QVBoxLayout()
@@ -332,16 +348,92 @@ class SubscribeInputDialog(QDialog):
 
     def get_url(self):
         return self.url_edit.text().strip()
+class QRCodeDialog(QDialog):
+    def __init__(self, data):
+        super().__init__()
+        self.setWindowTitle("Share Node QR Code")
+        layout = QVBoxLayout()
+        self.label = QLabel()
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+
+        pixmap = self.generate_qrcode_pixmap(data)
+        self.label.setPixmap(pixmap)
+
+    def generate_qrcode_pixmap(self, data):
+        qr = qrcode.QRCode(box_size=6, border=2)
+        qr.add_data(data)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white").convert('RGB')  # 转PIL Image
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        qimg = QImage.fromData(buffer.getvalue())
+        return QPixmap.fromImage(qimg)
+class NodeTree(QTreeWidget):
+    def __init__(self):
+        super().__init__()
+        self.setHeaderLabels(["Node"])
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+    def show_context_menu(self, pos):
+        item = self.itemAt(pos)
+        if item:
+            menu = QMenu(self)
+            delete_action = menu.addAction("Delete Node")
+            delete_action.triggered.connect(lambda: self.delete_node(item))
+            share_action = menu.addAction('Share')
+            share_action.triggered.connect(lambda: self.share_node(item))
+            menu.exec(self.viewport().mapToGlobal(pos))
     
+    def share_node(self, item):
+        ss_link = item.data(0, Qt.UserRole)
+        if not ss_link:
+            ss_link = "No ss:// link to share"
+        dlg = QRCodeDialog(ss_link)
+        dlg.exec()
+
+    def add_node(self, node_name, sub_nodes):
+            # 先找有没有同名顶层父节点
+            parent_items = self.findItems(node_name, Qt.MatchExactly)
+            if parent_items:
+                parent = parent_items[0]
+                self._add_subnodes(parent, sub_nodes)
+            else:
+                parent = QTreeWidgetItem(self, [node_name])
+                self.addTopLevelItem(parent)
+                self._add_subnodes(parent, sub_nodes)
+            parent.setExpanded(True)
+
+    def _add_subnodes(self, parent_node, sub_nodes):
+        for name, ss_url in sub_nodes:
+            # 可以判断避免重复添加
+            exists = False
+            for i in range(parent_node.childCount()):
+                if parent_node.child(i).text(0) == name:
+                    exists = True
+                    break
+            if not exists:
+                child = QTreeWidgetItem(parent_node, [name])
+                child.setData(0, Qt.UserRole, ss_url)
+                parent_node.addChild(child)
+
+    def delete_node(self, item):
+        parent = item.parent()
+        if parent is None:
+            index = self.indexOfTopLevelItem(item)
+            if index != -1:
+                self.takeTopLevelItem(index)
+        else:
+            parent.removeChild(item)
+
 class HomePage(QWidget):
-    def __init__(self, ss, inside_proxy):
+    def __init__(self, ss):
         super().__init__()
         layout = QVBoxLayout()
         self.ss = ss
-        self.inside_proxy = inside_proxy
 
         #        
-        self.btn_add_subscribe = QPushButton("+ 添加订阅")
+        self.btn_add_subscribe = QPushButton("+ add subscribe url")
         layout.addWidget(self.btn_add_subscribe)
         self.btn_add_subscribe.clicked.connect(self.show_subscribe_dialog)
 
@@ -351,13 +443,6 @@ class HomePage(QWidget):
         self.btn_ssr_toggle.clicked.connect(self.toggle_ssr)
         layout.addWidget(self.btn_ssr_toggle)
 
-        # 路由选择
-        layout.addWidget(QLabel("Route Selection:"))
-        self.route_combo = QComboBox()
-        self.route_combo.addItems(["Conf", "Proxy", "Detect"])
-        self.route_combo.currentIndexChanged.connect(self.route_changed)
-        layout.addWidget(self.route_combo)
-
         # test
         self.btn_test_proxy = QPushButton("测试 Shadowsocks 代理")
         layout.addWidget(self.btn_test_proxy)
@@ -365,8 +450,7 @@ class HomePage(QWidget):
 
         # 订阅节点树
         layout.addWidget(QLabel("Subscribed Nodes:"))
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Node", "Action"])
+        self.tree = NodeTree()
         layout.addWidget(self.tree)
 
         self.setLayout(layout)
@@ -378,13 +462,41 @@ class HomePage(QWidget):
         dialog = SubscribeInputDialog(self)
         if dialog.exec() == QDialog.Accepted:
             url = dialog.get_url()
-            print('subscribe: ', url)
-            if not url:
-                QMessageBox.warning(self, "警告", "订阅 URL 不能为空")
-            e, res = self.inside_proxy.get(url)
-            print('get sshs', e, res)
+            if url.startswith("http"):
+                print('subscribe: ', url)
+                if not url:
+                    QMessageBox.warning(self, "警告", "订阅 URL 不能为空")
+                e, res = self.ss.get(url)
+                sslinks = base64.b64decode(res.text.strip()).decode('utf-8').split('\n')
+                subnodes = []
+                for ss in sslinks:
+                    if not ss.strip():  # 跳过空行
+                        continue
+                    info = parse_ss_link(ss)
+                    if info is None:  # 跳过无法解析的
+                        continue
+                    subnodes.append((info['remark'], ss))
+
+                self.tree.add_node(urlparse(url).hostname, subnodes)
+                # store it into json
+                newnode = {
+                    'title': urlparse(url).hostname,
+                    'host':url,
+                    'subs':sslinks
+                }
+                self.ss.add_node_2json(newnode)
+            elif url.startswith('ss://'):
+                self.tree.add_node('FREEDOM', [(parse_ss_link(url)['remark'], url)])
+                with open("nodes.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)  # data 是一个 list
+                    freedom = data[0]
+                    freedom['subs'].append(url)
+                    # 写回文件
+                    with open("nodes.json", "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+
     def on_test_proxy_clicked(self):
-        ok = self.inside_proxy.test_shadowsocks_proxy()
+        ok = self.ss.test_shadowsocks_proxy()
         if ok:
             QMessageBox.information(self, "代理测试", "Shadowsocks 代理工作正常！")
         else:
@@ -398,14 +510,17 @@ class HomePage(QWidget):
             nodes = []
         for node in nodes:
             name = node.get('title','unknown')
-            try:
-                with open(name, 'r') as subsf:
-                    lines = subsf.readlines()
-                    self.add_node(name, [ (parse_ss_link(ss)['remark'] , ss) for ss in lines])
-            except Exception as e:
-                print('load failed ', e)
+            sslinks = node.get('subs', [])
+            subnodes = []
+            for ss in sslinks:
+                if not ss.strip():  # 跳过空行
+                    continue
+                info = parse_ss_link(ss)
+                if info is None:  # 跳过无法解析的
+                    continue
+                subnodes.append((info['remark'], ss))
+            self.tree.add_node(name, subnodes)
                         
-
     def toggle_ssr(self, checked):
         if checked:
             self.btn_ssr_toggle.setText("Stop SSR")
@@ -431,19 +546,6 @@ class HomePage(QWidget):
         route = self.route_combo.currentText()
         QMessageBox.information(self, "Route", f"Route changed to {route}")
         # 这里写路由切换逻辑
-
-    def add_node(self, node_name, sub_nodes):
-        parent = QTreeWidgetItem(self.tree, [node_name])
-        self.tree.addTopLevelItem(parent)
-        self.add_edit_button(parent)
-
-        for name, ss_url in sub_nodes:
-            child = QTreeWidgetItem(parent, [name])
-            child.setData(0, Qt.UserRole, ss_url)
-            parent.addChild(child)
-            self.add_edit_button(child)
-
-        parent.setExpanded(True)
 
     def add_edit_button(self, item):
         btn = QPushButton("Info")
@@ -541,25 +643,105 @@ class DataPage(QWidget):
         layout.addWidget(stats_label)
 
         # 日志组
-
+        logs_label = QLabel("log:")
         layout.addWidget(LogWidget())
 
         self.setLayout(layout)
+class ThemeManager:
+    def __init__(self, app):
+        self.app = app
+        self.dark_mode = False  # 默认浅色主题
+
+    def apply_dark_theme(self):
+        qss = """
+        QWidget {
+            background-color: #2b2b2b;
+            color: #ffffff;
+            font-size: 14px;
+        }
+        QLineEdit, QComboBox, QTreeWidget, QTableWidget {
+            background-color: #3c3f41;
+            border: 1px solid #555;
+            padding: 4px;
+            color: white;
+        }
+        QPushButton {
+            background-color: #555;
+            border: 1px solid #666;
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
+        QPushButton:hover {
+            background-color: #666;
+        }
+        QHeaderView::section {
+            background-color: #444;
+            padding: 4px;
+            border: 1px solid #666;
+        }
+        """
+        self.app.setStyleSheet(qss)
+
+    def apply_light_theme(self):
+        qss = """
+        QWidget {
+            background-color: #f5f5f5;
+            color: #000000;
+            font-size: 14px;
+        }
+        QLineEdit, QComboBox, QTreeWidget, QTableWidget {
+            background-color: #ffffff;
+            border: 1px solid #ccc;
+            padding: 4px;
+            color: black;
+        }
+        QPushButton {
+            background-color: #ddd;
+            border: 1px solid #aaa;
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
+        QPushButton:hover {
+            background-color: #ccc;
+        }
+        QHeaderView::section {
+            background-color: #eee;
+            padding: 4px;
+            border: 1px solid #ccc;
+        }
+        """
+        self.app.setStyleSheet(qss)
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        if self.dark_mode:
+            self.apply_dark_theme()
+        else:
+            self.apply_light_theme()
 
 class SettingPage(QWidget):
-    def __init__(self):
+    def __init__(self, theme_manager, version="1.0.0"):
         super().__init__()
+        self.theme_manager = theme_manager
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Setting Page"))
+
+        # 主题选择
+        self.btn_toggle_theme = QPushButton("Toggle Theme")
+        self.btn_toggle_theme.clicked.connect(self.theme_manager.toggle_theme)
+        layout.addWidget(self.btn_toggle_theme)
+
+        # 版本信息
+        version_label = QLabel(f"版本: {version}")
+        layout.addWidget(version_label)
+
         self.setLayout(layout)
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, theme_manager):
         super().__init__()
         self.ss = SS()
-        self.inside_proxy = InsideProxy()
-
-        self.setWindowTitle("SSR-like Client with Navigation")
+        self.theme_manager = theme_manager
+        self.setWindowTitle("SSR-like Client")
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -574,10 +756,10 @@ class MainWindow(QMainWindow):
 
         # 堆栈页面
         self.pages = QStackedWidget()
-        self.pages.addWidget(HomePage(self.ss, self.inside_proxy))
+        self.pages.addWidget(HomePage(self.ss))
         self.pages.addWidget(ConfPage())
         self.pages.addWidget(DataPage())
-        self.pages.addWidget(SettingPage())
+        self.pages.addWidget(SettingPage(theme_manager))
 
         layout.addWidget(self.nav_list)
         layout.addWidget(self.pages)
@@ -597,7 +779,9 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication([])
-    window = MainWindow()
-    window.resize(600, 400)
+    theme_manager = ThemeManager(app)
+    theme_manager.apply_light_theme()  # 初始浅色
+    window = MainWindow(theme_manager)
+    window.resize(800, 600)
     window.show()
     app.exec()
