@@ -18,6 +18,7 @@ import os
 import re
 import requests
 from urllib.parse import urlparse
+from datetime import datetime
 
 def resource_path(relative_path):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +85,9 @@ class GlobalLogger(QObject):
         self._initialized = True
         # 这里放初始化代码
 
-    def log(self, timestamp, level, message):
+    def log(self, message, level='INFO', timestamp = None):
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 线程安全写入（可加锁或用线程安全队列）
         self.new_log.emit(timestamp, level, message)
 
@@ -109,10 +112,10 @@ class SSLocalLogReader(QObject):
             m = re.match(pattern, line)
             if m:
                 timestamp, level, message = m.groups()
-                GlobalLogger().log(timestamp, level, message)  # 发给全局日志
+                GlobalLogger().log(message , level, timestamp)  # 发给全局日志
 
             else:
-                print("格式不匹配")
+                GlobalLogger().log(f"sslocal logreader err: 格式不匹配")
   
 class SS(QObject):
     def __init__(self):
@@ -142,7 +145,7 @@ class SS(QObject):
         ]
 
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        print(f"Shadowsocks 启动中... {cmd}")
+        GlobalLogger().log(f"Shadowsocks 启动中... {cmd}")
         # 创建线程和日志读取器
         self.thread = QThread()
         self.log_worker = SSLocalLogReader(self.proc)
@@ -161,12 +164,12 @@ class SS(QObject):
             if self.thread and self.thread.isRunning():
                 self.thread.quit()    # 让线程退出事件循环
                 self.thread.wait()    # 等待线程退出
-            print("Shadowsocks 已停止")
+            GlobalLogger().log("Shadowsocks 已停止")
 
     def test_shadowsocks_proxy(self, test_url="https://www.google.com"):
         
         e, res = self.get(test_url)
-        print('test proxy', e, res)
+        GlobalLogger().log('test proxy', e, res)
         if  e:
             return False
         if res.status_code == 200:
@@ -184,14 +187,14 @@ class SS(QObject):
             else:
                 return None, response
         except Exception as e:
-            print(f"代理测试异常: {e}")
+            GlobalLogger().log(f"代理测试异常: {e}")
             return e, None
     
     def add_node_2json(self, newnode):
         # 读取 JSON 文件
         with open(resource_path('resources/config.json'), "r", encoding="utf-8") as f:
             data = json.load(f)  # data 是一个 list
-
+        GlobalLogger().log(f'add a new subscribe node {newnode}')
         # 追加到数组
         data.append(newnode)
 
@@ -468,7 +471,7 @@ class HomePage(QWidget):
         if dialog.exec() == QDialog.Accepted:
             url = dialog.get_url()
             if url.startswith("http"):
-                print('subscribe: ', url)
+                GlobalLogger().log(f'will subscribe {url}')
                 if not url:
                     QMessageBox.warning(self, "警告", "订阅 URL 不能为空")
                 e, res = self.ss.get(url)
@@ -509,6 +512,7 @@ class HomePage(QWidget):
 
     def load_from_json(self, filepath):
         if not os.path.exists(filepath):
+            GlobalLogger().log(f'{filepath} is not found.')
             with open(filepath, 'w') as f:
                 json.dump([{
                     "title": "FREEDOM",
@@ -522,6 +526,7 @@ class HomePage(QWidget):
                 nodes = json.load(f)
         except Exception as e:
             nodes = []
+            GlobalLogger().log(f'open err: {e}', 'ERR')
 
         for node in nodes:
             name = node.get('title','unknown')
@@ -545,11 +550,9 @@ class HomePage(QWidget):
             if selected_item:
                 node_name = selected_item.text(0)                # 节点名称
                 ss_url = selected_item.data(0, Qt.UserRole)      # 绑定的 ss:// 数据（如果有）
-                print("选中节点名:", node_name)
-                print("对应的 ss:// 地址:", ss_url)
                 self.ss.start_ss(ss_url)
             else:
-                print("没有选中节点")
+                GlobalLogger().log("没有选中节点", 'ERR')
 
         else:
             self.btn_ssr_toggle.setText("Start SSR")
