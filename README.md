@@ -2,6 +2,7 @@ A ShadowsRocket-like linux (debian).
 
 1. features
 - only support socks proxy, don't support http proxy
+- only subscribe ss://
 
 2. used libs
 - `shadowsocks-libev`: ss local server.
@@ -18,3 +19,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://www.google.com -v
 
 4. todo
 - route selection with pac
+
+
+5. build
+pyinstaller -F  -n ssrdebian --windowed --icon=resources/logo.png --add-data "resources/config.json:resources" --add-data "resources/logo.png:resources" main.py

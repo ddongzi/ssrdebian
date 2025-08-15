@@ -14,10 +14,15 @@ import json
 import base64
 import urllib.parse
 import subprocess
-
+import os
 import re
 import requests
 from urllib.parse import urlparse
+
+def resource_path(relative_path):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, relative_path)
+
 # ss://
 # Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo1NzQ1MDJkMS01Y2FlLTQ0ODMtYTQ1Ny03ZmFkMjRmMjg3Y2M
 # @v1abc123.sched.sma-dk.hfifx.xin:40060
@@ -184,14 +189,14 @@ class SS(QObject):
     
     def add_node_2json(self, newnode):
         # 读取 JSON 文件
-        with open("nodes.json", "r", encoding="utf-8") as f:
+        with open(resource_path('resources/config.json'), "r", encoding="utf-8") as f:
             data = json.load(f)  # data 是一个 list
 
         # 追加到数组
         data.append(newnode)
 
         # 写回文件
-        with open("nodes.json", "w", encoding="utf-8") as f:
+        with open(resource_path('resources/config.json'), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
 class EditParentNodeDialog(QDialog):
@@ -456,7 +461,7 @@ class HomePage(QWidget):
         self.setLayout(layout)
 
         # 
-        self.load_from_json('nodes.json')
+        self.load_from_json(resource_path('resources/config.json'))
 
     def show_subscribe_dialog(self):
         dialog = SubscribeInputDialog(self)
@@ -487,12 +492,12 @@ class HomePage(QWidget):
                 self.ss.add_node_2json(newnode)
             elif url.startswith('ss://'):
                 self.tree.add_node('FREEDOM', [(parse_ss_link(url)['remark'], url)])
-                with open("nodes.json", "r", encoding="utf-8") as f:
+                with open(resource_path('resources/config.json'), "r", encoding="utf-8") as f:
                     data = json.load(f)  # data 是一个 list
                     freedom = data[0]
                     freedom['subs'].append(url)
                     # 写回文件
-                    with open("nodes.json", "w", encoding="utf-8") as f:
+                    with open(resource_path('resources/config.json'), "w", encoding="utf-8") as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
 
     def on_test_proxy_clicked(self):
@@ -503,11 +508,21 @@ class HomePage(QWidget):
             QMessageBox.warning(self, "代理测试", "代理测试失败，请检查配置或连接。")
 
     def load_from_json(self, filepath):
+        if not os.path.exists(filepath):
+            with open(filepath, 'w') as f:
+                json.dump([{
+                    "title": "FREEDOM",
+                    "subs": []
+                    }], 
+                    f, ensure_ascii=False, indent=2
+                )
+
         try:
             with open(filepath, 'r') as f:
                 nodes = json.load(f)
         except Exception as e:
             nodes = []
+
         for node in nodes:
             name = node.get('title','unknown')
             sslinks = node.get('subs', [])
@@ -520,7 +535,7 @@ class HomePage(QWidget):
                     continue
                 subnodes.append((info['remark'], ss))
             self.tree.add_node(name, subnodes)
-                        
+       
     def toggle_ssr(self, checked):
         if checked:
             self.btn_ssr_toggle.setText("Stop SSR")
