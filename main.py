@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QListWidget,
     QStackedWidget, QLabel, QHBoxLayout, QPushButton, QComboBox, QMessageBox,
     QLineEdit, QFormLayout, QDialogButtonBox, QDialog, QTreeWidget,
-    QTreeWidgetItem, QCheckBox, QGroupBox, QMenu
+    QTreeWidgetItem, QCheckBox, QGroupBox, QMenu, QPlainTextEdit, QTextEdit
 )
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal, QMutex
 from PySide6.QtGui import QPixmap, QImage
@@ -19,7 +19,10 @@ import re
 import requests
 from urllib.parse import urlparse
 from datetime import datetime
-
+import asyncio
+import yaml
+import ipaddress
+from queue import Queue
 def resource_path(relative_path):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, relative_path)
@@ -61,35 +64,343 @@ def parse_ss_link(ss_link):
         "port": port,
         "remark": remark
     }
+class Config:
+    def __init__(self, path="resources/config.yml"):
+        self.path = resource_path(path)
+        print(self.path)
+        self.load_config()
+
+    def load_config(self):
+        with open(self.path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f)
+        # server
+        server = cfg.get("server", {})
+        self.listen_host = server.get("listen_host", '0.0.0.0')
+        self.listen_port = server.get("listen_port", 1081)
+        self.socks_host = server.get("socks_host", '0.0.0.0')
+        self.socks_port = server.get("socks_port", 1080)
+
+        # proxies
+        self.proxies = {}
+        for p in cfg.get("proxies", []):
+            self.proxies[p["name"]] = p
+
+        # proxy groups
+        self.proxy_groups = {}
+        for g in cfg.get("proxy-groups", []):
+            self.proxy_groups[g["name"]] = g
+        # rules
+        self.rules = []
+        for r in cfg.get("rules", []):
+            parts = r.split(",")
+            if len(parts) == 2:
+                self.rules.append((parts[0], parts[1], None))
+            elif len(parts) == 3:
+                self.rules.append((parts[0], parts[1], parts[2]))
+
+    def match(self, target):
+        import ipaddress
+        for rule in self.rules:
+
+            rtype = rule[0]
+            value = rule[1] if len(rule) > 1 else None
+            action = rule[2] if len(rule) > 2 else None
+
+            if rtype == "DOMAIN-SUFFIX" and target.endswith(value):
+                return action
+            if rtype == "DOMAIN-KEYWORD" and value in target:
+                return action
+            if rtype == "IP-CIDR":
+                try:
+                    if ipaddress.ip_address(target) in ipaddress.ip_network(value):
+                        return action
+                except ValueError:
+                    pass
+            if rtype == "FINAL":
+                return value
+        return "DIRECT"  # fallback
+
+    def add_ss_proxy(self, name, ss_url, group_name = 'FREEDOM'):
+        if os.path.exists(self.path):
+            with open(self.path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+        else:
+            cfg = {}
+
+        if "proxies" not in cfg:
+            cfg["proxies"] = []
+
+        # 检查是否已存在同名节点
+        for p in cfg["proxies"]:
+            if p["name"] == name:
+                p["url"] = ss_url
+                break
+        else:
+            cfg["proxies"].append({"name": name, "type": "ss", "url": ss_url})
+
+        # 添加到 proxy-group
+        if group_name:
+            if "proxy-groups" not in cfg:
+                cfg["proxy-groups"] = []
+
+            group = next((g for g in cfg["proxy-groups"] if g["name"] == group_name), None)
+            if group:
+                if "proxies" not in group:
+                    group["proxies"] = []
+                if name not in group["proxies"]:
+                    group["proxies"].append(name)
+            else:
+                # 如果组不存在，创建一个 select 类型组
+                cfg["proxy-groups"].append({
+                    "name": group_name,
+                    "type": "select",
+                    "proxies": [name]
+                })
+
+        # 写回 YAML
+        with open(self.path, 'w', encoding='utf-8') as f:
+            yaml.dump(cfg, f, allow_unicode=True)
+
+        GlobalLogger().log(f"Proxy {name} added to {self.path}")
+
+class ProxyServer:
+    def __init__(self, config):
+        self.config = config
+        self.ss = SS(self.config.socks_host, self.config.socks_port)
+        
+    async def get_host_from_data(self, data, writer):
+        """
+        安全解析 TCP 流中的 HTTP/HTTPS 请求 Host
+        data: bytes
+        writer: asyncio.StreamWriter，用于在解析失败时关闭连接
+        """
+        try:
+            header = data.decode(errors="ignore")
+        except Exception:
+            writer.close()
+            await writer.wait_closed()
+            return None
+
+        host = None
+        for line in header.split("\r\n"):  # 或 "\n"
+            if not isinstance(line, str):
+                continue
+            line_lower = line.lower()
+            if line_lower.startswith("host:"):
+                # partition 更安全，防止 split 报错
+                host = line.partition(":")[2].strip()
+                # 如果 host 中带端口，例如 host: example.com:8080
+                if ":" in host:
+                    host, port_str = host.split(":", 1)
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        port = 80
+                break
+            # CONNECT 方法特殊处理
+            if line_lower.startswith("connect "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    host_port = parts[1].strip()
+                    if ":" in host_port:
+                        host, port_str = host_port.split(":", 1)
+                        try:
+                            port = int(port_str)
+                        except ValueError:
+                            port = 443
+                    else:
+                        host = host_port
+                        port = 443
+                break
+
+        if not host:
+            writer.close()
+            await writer.wait_closed()
+            return None, None
+
+        return host, port
+
+    async def handle_client(self, reader, writer):
+        try:
+            data = await reader.read(4096)
+            if not data:
+                return
+
+            first_line = data.split(b"\r\n", 1)[0].decode(errors="ignore")
+            if first_line.startswith("CONNECT"):
+                # HTTPS 隧道代理
+                host_port = first_line.split(" ")[1]   # "baidu.com:443"
+                host, port = host_port.split(":")
+                port = int(port)
+
+                strategy = self.config.match(host)
+                GlobalLogger().log(f"[RULE] {host}:{port} -> {strategy}")
+
+                if strategy.upper() == "PROXY":
+                    remote_reader, remote_writer = await self.socks5_connect(
+                            self.ss.proxy_host, self.ss.proxy_port, host, port
+                        )
+                else:  # DIRECT
+                    remote_reader, remote_writer = await asyncio.open_connection(
+                        host, port
+                    )
+
+                # 返回 200 给浏览器，表示隧道建立成功
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+
+                # 隧道转发
+                asyncio.create_task(self.pipe(reader, remote_writer))
+                asyncio.create_task(self.pipe(remote_reader, writer))
+
+            else:
+                # 普通 HTTP 请求
+                host, port = await self.get_host_from_data(data, writer)
+                if not host:
+                    GlobalLogger().log(f'host parse err.{data}', 'ERR')
+                    return
+
+                strategy = self.config.match(host)
+                GlobalLogger().log(f"[RULE] {host}:{port} -> {strategy}")
+
+                if strategy.upper() == "PROXY":
+                   remote_reader, remote_writer = await self.socks5_connect(
+                            self.ss.proxy_host, self.ss.proxy_port, host, port
+                        )
+                else:  # DIRECT
+                    remote_reader, remote_writer = await asyncio.open_connection(
+                        host, port
+                    )
+
+                # 转发首包
+                remote_writer.write(data)
+                await remote_writer.drain()
+
+                # pipe 双向转发
+                asyncio.create_task(self.pipe(reader, remote_writer))
+                asyncio.create_task(self.pipe(remote_reader, writer))
+
+        except Exception as e:
+            GlobalLogger().log(f"{e}", level='ERR')
+            writer.close()
+    # pipe 双向转发
+    async def pipe(self, r, w):
+        try:
+            while True:
+                buf = await r.read(4096)
+                if not buf:
+                    break
+                w.write(buf)
+                await w.drain()
+        except Exception:
+            pass
+        finally:
+            w.close()
+    async def socks5_connect(self,proxy_host, proxy_port, dest_host, dest_port):
+        """
+        通过 SOCKS5 代理连接目标 host:port
+        返回 (reader, writer)
+        """
+        import struct
+        reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
+
+        # -------------------
+        # 1. 握手
+        # -------------------
+        # 0x05 = SOCKS5, 0x01 = 支持一个认证方法, 0x00 = 不需要认证
+        writer.write(b"\x05\x01\x00")
+        await writer.drain()
+        resp = await reader.readexactly(2)
+        if resp[0] != 0x05 or resp[1] != 0x00:
+            raise RuntimeError("SOCKS5 handshake failed")
+
+        # -------------------
+        # 2. 发送 CONNECT 请求
+        # -------------------
+        dest_ip_bytes = None
+        try:
+            # 尝试解析成 IP
+            import ipaddress
+            ip_obj = ipaddress.ip_address(dest_host)
+            dest_ip_bytes = ip_obj.packed
+            addr_type = 0x01  # IPv4 或 IPv6
+        except:
+            addr_type = 0x03  # domain
+
+        if addr_type == 0x01:
+            # IPv4 或 IPv6
+            writer.write(b"\x05\x01\x00" + bytes([len(dest_ip_bytes)]) + dest_ip_bytes + struct.pack(">H", dest_port))
+        else:
+            # domain
+            host_bytes = dest_host.encode()
+            writer.write(b"\x05\x01\x00" + bytes([addr_type]) + bytes([len(host_bytes)]) + host_bytes + struct.pack(">H", dest_port))
+        await writer.drain()
+
+        # 读取响应
+        # resp: VER(1) REP(1) RSV(1) ATYP(1) BND.ADDR + BND.PORT
+        resp = await reader.read(4)
+        if len(resp) < 4 or resp[1] != 0x00:
+            raise RuntimeError("SOCKS5 connect failed")
+        # 读取剩余 BND.ADDR + BND.PORT
+        if resp[3] == 0x01:
+            await reader.read(4 + 2)
+        elif resp[3] == 0x03:
+            l = await reader.read(1)
+            await reader.read(l[0] + 2)
+        elif resp[3] == 0x04:
+            await reader.read(16 + 2)
+        else:
+            raise RuntimeError("Unknown ATYP")
+
+        return reader, writer
+
+    async def run(self):
+        server = await asyncio.start_server(
+            self.handle_client, self.config.listen_host, self.config.listen_port
+        )
+        GlobalLogger().log(f"Proxy running at {self.config.listen_host}:{self.config.listen_port}")
+        async with server:
+            await server.serve_forever()
+
 
 class GlobalLogger(QObject):
     new_log = Signal(str, str, str)  # timestamp, level, message
 
     _instance = None
-    _mutex = QMutex()
-    _initialized = False
-    def __new__(cls):
-        if not cls._instance:
-            cls._mutex.lock()
-            try:
-                if not cls._instance:
-                    cls._instance = super().__new__(cls)
-            finally:
-                cls._mutex.unlock()
-        return cls._instance
+    _lock = threading.Lock()
     
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self):
-        if self._initialized:
+        if hasattr(self, '_initialized') and self._initialized:
             return
         super().__init__()
         self._initialized = True
-        # 这里放初始化代码
 
-    def log(self, message, level='INFO', timestamp = None):
+        # 线程安全队列
+        self._queue = Queue()
+
+        # 定时器刷新队列
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._flush)
+        self._timer.start(200)  # 200ms 刷新一次
+
+    def log(self, message, level='INFO', timestamp=None):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 线程安全写入（可加锁或用线程安全队列）
-        self.new_log.emit(timestamp, level, message)
+        # 直接放入队列，不发信号
+        self._queue.put((timestamp, level, message))
+
+    def _flush(self):
+        while not self._queue.empty():
+            timestamp, level, message = self._queue.get()
+            self.new_log.emit(timestamp, level, message)
+
 
 class SSLocalLogReader(QObject):
     def __init__(self, proc):
@@ -101,9 +412,9 @@ class SSLocalLogReader(QObject):
         self._running = False
 
     def run(self):
+        GlobalLogger().log(f'ss local log reader thread start: {threading.get_ident()}')
         while self._running:
             line = self.proc.stdout.readline()
-
             if not line:
                 break
             line = line.strip()
@@ -112,25 +423,25 @@ class SSLocalLogReader(QObject):
             m = re.match(pattern, line)
             if m:
                 timestamp, level, message = m.groups()
-                GlobalLogger().log(message , level, timestamp)  # 发给全局日志
+                GlobalLogger().log('ss-local:'+message , level, timestamp)  # 发给全局日志
 
             else:
                 GlobalLogger().log(f"sslocal logreader err: 格式不匹配")
   
 class SS(QObject):
-    def __init__(self):
+    def __init__(self, ss_host = '127.0.0.1', ss_port = 1080):
         super().__init__()
         self.proc = None
         self.thread = None
         self.running = False
-        self.proxy_host = '127.0.0.1'
-        self.proxy_port = 1080
+        self.proxy_host = ss_host
+        self.proxy_port = ss_port
         self.proxies = {
            "http": f"socks5h://{self.proxy_host}:{self.proxy_port}",
             "https": f"socks5h://{self.proxy_host}:{self.proxy_port}"
         }
 
-    def start_ss(self, ss_link):
+    def connect_ss(self, ss_link):
         ss_info = parse_ss_link(ss_link)
 
         cmd = [
@@ -139,8 +450,8 @@ class SS(QObject):
             "-p", str(ss_info['port']),     # 服务器端口
             "-k", ss_info['password'],      # 密码
             "-m", ss_info['method'],        # 加密方式
-            "-b", "127.0.0.1",              # 本地监听地址
-            "-l", "1080",                   # 本地 SOCKS5 端口
+            "-b", self.proxy_host,              # 本地监听地址
+            "-l", str(self.proxy_port),                   # 本地 SOCKS5 端口
             "-v"                            # verbose
         ]
 
@@ -154,7 +465,7 @@ class SS(QObject):
         self.thread.start()
         self.running = True
 
-    def stop_ss(self):
+    def close_ss(self):
         self.running = False
         if self.proc:
             self.proc.terminate()
@@ -166,16 +477,6 @@ class SS(QObject):
                 self.thread.wait()    # 等待线程退出
             GlobalLogger().log("Shadowsocks 已停止")
 
-    def test_shadowsocks_proxy(self, test_url="https://www.google.com"):
-        
-        e, res = self.get(test_url)
-        GlobalLogger().log('test proxy', e, res)
-        if  e:
-            return False
-        if res.status_code == 200:
-            return True
-        else:
-            return False
     def get(self, url):
         try:
             if self.running:
@@ -189,147 +490,7 @@ class SS(QObject):
         except Exception as e:
             GlobalLogger().log(f"代理测试异常: {e}")
             return e, None
-    
-    def add_node_2json(self, newnode):
-        # 读取 JSON 文件
-        with open(resource_path('resources/config.json'), "r", encoding="utf-8") as f:
-            data = json.load(f)  # data 是一个 list
-        GlobalLogger().log(f'add a new subscribe node {newnode}')
-        # 追加到数组
-        data.append(newnode)
 
-        # 写回文件
-        with open(resource_path('resources/config.json'), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-class EditParentNodeDialog(QDialog):
-    def __init__(self, node_data=None):
-        super().__init__()
-        self.setWindowTitle("Edit Parent Node Info")
-
-        self.node_data = node_data or {
-            "type": "subscribe",
-            "url": "",
-            "nickname": ""
-        }
-
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["subscribe", "socks5", "vmess", "https", "trojan"])
-        self.type_combo.setCurrentText(self.node_data.get("type", "subscribe"))
-
-        self.url_edit = QLineEdit(self.node_data.get("url", ""))
-        self.nickname_edit = QLineEdit(self.node_data.get("nickname", ""))
-
-        form = QFormLayout()
-        form.addRow("Type:", self.type_combo)
-        form.addRow("URL:", self.url_edit)
-        form.addRow("Nickname:", self.nickname_edit)
-
-        self.share_btn = QPushButton("Share Node (JSON)")
-        self.share_btn.clicked.connect(self.share_node)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout()
-        layout.addLayout(form)
-        layout.addWidget(self.share_btn)
-        layout.addWidget(QLabel("（二维码分享功能可用第三方库如 qrcode 实现）"))
-        layout.addWidget(buttons)
-        self.setLayout(layout)
-
-    def share_node(self):
-        data = {
-            "type": self.type_combo.currentText(),
-            "url": self.url_edit.text(),
-            "nickname": self.nickname_edit.text()
-        }
-        json_str = json.dumps(data, indent=2)
-        # 简单弹窗展示 JSON，后续可以做复制到剪贴板或生成二维码
-        QMessageBox.information(self, "Share Node JSON", json_str)
-
-    def get_data(self):
-        return {
-            "type": self.type_combo.currentText(),
-            "url": self.url_edit.text(),
-            "nickname": self.nickname_edit.text()
-        }
-class EditSubNodeDialog(QDialog):
-    def __init__(self, node_data=None):
-        super().__init__()
-        self.setWindowTitle("Edit Sub-Node Info")
-
-        self.node_data = node_data or {"type": "socks5"}
-
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["socks5", "vmess", "trojan"])
-        self.type_combo.setCurrentText(self.node_data.get("type", "socks5"))
-        self.type_combo.currentIndexChanged.connect(self.update_form_fields)
-
-        self.form_layout = QFormLayout()
-
-        # 通用字段控件
-        self.host_edit = QLineEdit()
-        self.port_edit = QLineEdit()
-        self.passwd_edit = QLineEdit()
-        self.alg_edit = QLineEdit()
-
-        # 按类型组织字段，便于动态展示
-        self.fields_map = {
-            "socks5": [("Host", self.host_edit), ("Port", self.port_edit), ("Password", self.passwd_edit)],
-            "vmess": [("Host", self.host_edit), ("Port", self.port_edit), ("Algorithm", self.alg_edit)],
-            "trojan": [("Host", self.host_edit), ("Port", self.port_edit), ("Password", self.passwd_edit)],
-        }
-
-        # 初始化表单
-        self.main_widget = QWidget()
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.addWidget(QLabel("Type:"))
-        self.main_layout.addWidget(self.type_combo)
-        self.main_layout.addLayout(self.form_layout)
-
-        # 按钮区
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        self.main_layout.addWidget(buttons)
-
-        self.setLayout(self.main_layout)
-
-        # 填充默认值
-        self.fill_default_values()
-        self.update_form_fields()
-
-    def fill_default_values(self):
-        self.host_edit.setText(self.node_data.get("host", ""))
-        self.port_edit.setText(str(self.node_data.get("port", "")))
-        self.passwd_edit.setText(self.node_data.get("password", ""))
-        self.alg_edit.setText(self.node_data.get("algorithm", ""))
-
-    def update_form_fields(self):
-        # 清空现有字段
-        while self.form_layout.count():
-            item = self.form_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        current_type = self.type_combo.currentText()
-        fields = self.fields_map.get(current_type, [])
-
-        for label, widget in fields:
-            self.form_layout.addRow(label + ":", widget)
-
-    def get_data(self):
-        data = {"type": self.type_combo.currentText()}
-        current_type = data["type"]
-        fields = self.fields_map.get(current_type, [])
-
-        for label, widget in fields:
-            key = label.lower().replace(" ", "")
-            data[key] = widget.text()
-
-        return data
 class SubscribeInputDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -435,11 +596,10 @@ class NodeTree(QTreeWidget):
             parent.removeChild(item)
 
 class HomePage(QWidget):
-    def __init__(self, ss):
+    def __init__(self, server):
         super().__init__()
         layout = QVBoxLayout()
-        self.ss = ss
-
+        self.server = server
         #        
         self.btn_add_subscribe = QPushButton("+ add subscribe url")
         layout.addWidget(self.btn_add_subscribe)
@@ -451,11 +611,6 @@ class HomePage(QWidget):
         self.btn_ssr_toggle.clicked.connect(self.toggle_ssr)
         layout.addWidget(self.btn_ssr_toggle)
 
-        # test
-        self.btn_test_proxy = QPushButton("测试 Shadowsocks 代理")
-        layout.addWidget(self.btn_test_proxy)
-        self.btn_test_proxy.clicked.connect(self.on_test_proxy_clicked)
-
         # 订阅节点树
         layout.addWidget(QLabel("Subscribed Nodes:"))
         self.tree = NodeTree()
@@ -464,7 +619,15 @@ class HomePage(QWidget):
         self.setLayout(layout)
 
         # 
-        self.load_from_json(resource_path('resources/config.json'))
+        self.load_proxies_to_tree()
+    def load_proxies_to_tree(self):
+        # 先加载 proxy-groups
+        proxy_groups = self.server.config.proxy_groups
+        proxies = self.server.config.proxies
+        for name, group in proxy_groups.items():
+            for proxy_name in group['proxies']:
+                p = proxies.get(proxy_name)
+                self.tree.add_node(name, [(p['name'], p['url'])])
 
     def show_subscribe_dialog(self):
         dialog = SubscribeInputDialog(self)
@@ -474,73 +637,22 @@ class HomePage(QWidget):
                 GlobalLogger().log(f'will subscribe {url}')
                 if not url:
                     QMessageBox.warning(self, "警告", "订阅 URL 不能为空")
-                e, res = self.ss.get(url)
+                e, res = self.server.ss.get(url)
                 sslinks = base64.b64decode(res.text.strip()).decode('utf-8').split('\n')
-                subnodes = []
-                for ss in sslinks:
-                    if not ss.strip():  # 跳过空行
-                        continue
-                    info = parse_ss_link(ss)
-                    if info is None:  # 跳过无法解析的
-                        continue
-                    subnodes.append((info['remark'], ss))
+                for sslink in sslinks:
+                    ss_info = parse_ss_link(sslink)
+                    print(ss_info)
+                    if ss_info:
+                        self.server.config.add_ss_proxy(ss_info['remark'], sslink)            
+                self.tree.clear()
+                self.load_proxies_to_tree()
 
-                self.tree.add_node(urlparse(url).hostname, subnodes)
-                # store it into json
-                newnode = {
-                    'title': urlparse(url).hostname,
-                    'host':url,
-                    'subs':sslinks
-                }
-                self.ss.add_node_2json(newnode)
             elif url.startswith('ss://'):
-                self.tree.add_node('FREEDOM', [(parse_ss_link(url)['remark'], url)])
-                with open(resource_path('resources/config.json'), "r", encoding="utf-8") as f:
-                    data = json.load(f)  # data 是一个 list
-                    freedom = data[0]
-                    freedom['subs'].append(url)
-                    # 写回文件
-                    with open(resource_path('resources/config.json'), "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                self.server.config.add_ss_proxy(parse_ss_link(url)['remark'], url)            
+                self.tree.clear()
+                self.load_proxies_to_tree()
 
-    def on_test_proxy_clicked(self):
-        ok = self.ss.test_shadowsocks_proxy()
-        if ok:
-            QMessageBox.information(self, "代理测试", "Shadowsocks 代理工作正常！")
-        else:
-            QMessageBox.warning(self, "代理测试", "代理测试失败，请检查配置或连接。")
 
-    def load_from_json(self, filepath):
-        if not os.path.exists(filepath):
-            GlobalLogger().log(f'{filepath} is not found.')
-            with open(filepath, 'w') as f:
-                json.dump([{
-                    "title": "FREEDOM",
-                    "subs": []
-                    }], 
-                    f, ensure_ascii=False, indent=2
-                )
-
-        try:
-            with open(filepath, 'r') as f:
-                nodes = json.load(f)
-        except Exception as e:
-            nodes = []
-            GlobalLogger().log(f'open err: {e}', 'ERR')
-
-        for node in nodes:
-            name = node.get('title','unknown')
-            sslinks = node.get('subs', [])
-            subnodes = []
-            for ss in sslinks:
-                if not ss.strip():  # 跳过空行
-                    continue
-                info = parse_ss_link(ss)
-                if info is None:  # 跳过无法解析的
-                    continue
-                subnodes.append((info['remark'], ss))
-            self.tree.add_node(name, subnodes)
-       
     def toggle_ssr(self, checked):
         if checked:
             self.btn_ssr_toggle.setText("Stop SSR")
@@ -550,7 +662,7 @@ class HomePage(QWidget):
             if selected_item:
                 node_name = selected_item.text(0)                # 节点名称
                 ss_url = selected_item.data(0, Qt.UserRole)      # 绑定的 ss:// 数据（如果有）
-                self.ss.start_ss(ss_url)
+                self.server.ss.connect_ss(ss_url)
             else:
                 GlobalLogger().log("没有选中节点", 'ERR')
 
@@ -558,42 +670,45 @@ class HomePage(QWidget):
             self.btn_ssr_toggle.setText("Start SSR")
             QMessageBox.information(self, "SSR", "SSR stopped")
             # 这里关闭 SSR 逻辑
-            self.ss.stop_ss()
+            self.server.ss.close_ss()
             
-    def route_changed(self, index):
-        route = self.route_combo.currentText()
-        QMessageBox.information(self, "Route", f"Route changed to {route}")
-        # 这里写路由切换逻辑
-
-    def add_edit_button(self, item):
-        btn = QPushButton("Info")
-        self.tree.setItemWidget(item, 1, btn)
-        btn.clicked.connect(lambda checked, it=item: self.edit_node(it))
-
-    def edit_node(self, item):
-        # 这里假设 item.data(0, Qt.UserRole) 存着节点信息字典
-        node_data = item.data(0, Qt.UserRole) or {}
-
-        node_type = node_data.get("type", "sub")  # 假设父节点是 "parent" 或 type为订阅相关的
-
-        if node_type == "parent" or node_type == "subscribe":
-            dialog = EditParentNodeDialog(node_data)
-        else:
-            dialog = EditSubNodeDialog(node_data)
-
-        if dialog.exec() == QDialog.Accepted:
-            new_data = dialog.get_data()
-            item.setText(0, new_data.get("nickname") or new_data.get("name") or item.text(0))
-            # 更新 item 存储的数据
-            item.setData(0, Qt.UserRole, new_data)
-
-
 class ConfPage(QWidget):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
+        self.config = config
+
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Configuration Page"))
         self.setLayout(layout)
+        self.label = QLabel(f'R/W: {self.config.path}')
+        layout.addWidget(self.label)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)  # 禁止自动换行
+        self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)  # 出现水平滚动条
+        layout.addWidget(self.editor)
+
+        save_btn = QPushButton("Save Config")
+        save_btn.clicked.connect(self.save_conf)
+        layout.addWidget(save_btn)
+
+        self.load_conf()
+
+    def load_conf(self):
+        try:
+            with open(self.config.path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.editor.setPlainText(content)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load config: {e}")
+
+    def save_conf(self):
+        try:
+            content = self.editor.toPlainText()
+            with open(self.config.path, "w", encoding="utf-8") as f:
+                f.write(content)
+            QMessageBox.information(self, "Saved", "Configuration saved successfully!")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save config: {e}")
 class LogProxyOptionsWidget(QWidget):
     def __init__(self):
         super().__init__()
@@ -610,46 +725,60 @@ class LogProxyOptionsWidget(QWidget):
 
 
 class LogWidget(QWidget):
+    new_log = Signal(str, str, str)
     def __init__(self):
         super().__init__()
-        self.log_tree = QTreeWidget()
-        self.log_tree.setHeaderLabels(["Time", "Level", "Message"])
+        layout = QVBoxLayout(self)
 
-        layout = QVBoxLayout()
-        layout.addWidget(self.log_tree)
-        self.setLayout(layout)
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)      # 只读
+        layout.addWidget(self.log_text)
 
         self.logs = []  # [(timestamp, level, message), ...]
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_logs)
-        self.timer.start(2000)  # 2秒刷新一次
+        self.timer.start(5000)  # 每秒刷新
 
+        # 假设你有全局日志信号
         GlobalLogger().new_log.connect(self.add_log)
 
     def add_log(self, timestamp, level, message):
         self.logs.append((timestamp, level, message))
 
     def refresh_logs(self):
-        # 先清空
-        self.log_tree.clear()
-
-        # 按等级分组
-        groups = {}
+        # 清空并重新显示（如果日志太多，也可以改为只追加最新几条）
+        self.log_text.clear()
         for t, lvl, msg in self.logs:
-            if lvl not in groups:
-                groups[lvl] = []
-            groups[lvl].append((t, msg))
+            self.log_text.appendPlainText(f"[{t}] [{lvl}] {msg}")
 
-        # 按等级顺序展示（自定义顺序）
-        level_order = ["ERROR", "WARN", "INFO", "DEBUG"]
-        for lvl in level_order:
-            if lvl in groups:
-                parent = QTreeWidgetItem(self.log_tree, [ "", lvl ])
-                for t, msg in groups[lvl]:
-                    QTreeWidgetItem(parent, [t, "", msg])
+class NodeStatsWidget(QWidget):
+    def __init__(self, server):
+        super().__init__()
+        self.server = server  # 你的 SSR/SS 服务对象
+        layout = QVBoxLayout()
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)  # 只读，不允许编辑
+        layout.addWidget(self.text)
+        self.setLayout(layout)
 
-        self.log_tree.expandAll()
+        # 定时刷新
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_stats)
+        self.timer.start(2000)  # 每2秒刷新一次
+
+        self.update_stats()
+
+    def update_stats(self):
+        self.text.clear()
+        nodes = self.server.get_all_nodes_stats()  # 你需要在 server 提供方法返回 list/dict
+        for node in nodes:
+            up = node.get('up_bytes', 0)/1024
+            down = node.get('down_bytes', 0)/1024
+            total = node.get('total_bytes', 0)/1024
+            self.text.append(
+                f"{node['name']}: Up {up:.1f} KB, Down {down:.1f} KB, Total {total:.1f} KB"
+            )
 
 class DataPage(QWidget):
     def __init__(self):
@@ -738,7 +867,7 @@ class ThemeManager:
             self.apply_light_theme()
 
 class SettingPage(QWidget):
-    def __init__(self, theme_manager, version="1.0.0"):
+    def __init__(self, theme_manager, version="1.0.1"):
         super().__init__()
         self.theme_manager = theme_manager
         layout = QVBoxLayout()
@@ -755,10 +884,12 @@ class SettingPage(QWidget):
         self.setLayout(layout)
 
 class MainWindow(QMainWindow):
-    def __init__(self, theme_manager):
+    def __init__(self, theme_manager, config, server):
         super().__init__()
-        self.ss = SS()
         self.theme_manager = theme_manager
+        self.config = config
+        self.server = server
+
         self.setWindowTitle("SSR-like Client")
 
         central_widget = QWidget()
@@ -774,8 +905,8 @@ class MainWindow(QMainWindow):
 
         # 堆栈页面
         self.pages = QStackedWidget()
-        self.pages.addWidget(HomePage(self.ss))
-        self.pages.addWidget(ConfPage())
+        self.pages.addWidget(HomePage(self.server))
+        self.pages.addWidget(ConfPage(self.config))
         self.pages.addWidget(DataPage())
         self.pages.addWidget(SettingPage(theme_manager))
 
@@ -790,16 +921,24 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # 优雅终止子进程
-        self.ss.stop_ss()
+        self.server.ss.close_ss()
         # 关闭其他资源，如打开的socket、文件等
 
         event.accept()  # 允许窗口关闭
+
+def start_server():
+    GlobalLogger().log(f'proxy server thread start: {threading.get_ident()}')
+    asyncio.run(server.run())
 
 if __name__ == "__main__":
     app = QApplication([])
     theme_manager = ThemeManager(app)
     theme_manager.apply_light_theme()  # 初始浅色
-    window = MainWindow(theme_manager)
+    config = Config()
+    server = ProxyServer(config)
+    window = MainWindow(theme_manager, config, server)
+
+    threading.Thread(target=start_server, daemon=True).start()
     window.resize(800, 600)
     window.show()
     app.exec()

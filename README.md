@@ -22,4 +22,4 @@ curl --socks5-hostname 127.0.0.1:1080 https://www.google.com -v
 
 
 5. build
-pyinstaller -F  -n ssrdebian --windowed --icon=resources/logo.png --add-data "resources/config.json:resources" --add-data "resources/logo.png:resources" main.py
+pyinstaller -F  -n ssrdebian --windowed --icon=resources/logo.png --add-data "resources/config.yml:resources" --add-data "resources/logo.png:resources" main.py
