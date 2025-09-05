@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QCheckBox, QGroupBox, QMenu, QPlainTextEdit, QTextEdit
 )
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal, QMutex
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QFont
 import qrcode
 from io import BytesIO
 # from PIL import Image
@@ -14,18 +14,13 @@ import json
 import base64
 import urllib.parse
 import subprocess
-import os
 import re
 import requests
 from urllib.parse import urlparse
-from datetime import datetime
 import asyncio
-import yaml
-import ipaddress
-from queue import Queue
-def resource_path(relative_path):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_dir, relative_path)
+from config import get_config, get_config_path
+from logger import GlobalLogger
+from tools import resource_path
 
 # ss://
 # Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo1NzQ1MDJkMS01Y2FlLTQ0ODMtYTQ1Ny03ZmFkMjRmMjg3Y2M
@@ -64,109 +59,10 @@ def parse_ss_link(ss_link):
         "port": port,
         "remark": remark
     }
-class Config:
-    def __init__(self, path="resources/config.yml"):
-        self.path = resource_path(path)
-        print(self.path)
-        self.load_config()
-
-    def load_config(self):
-        with open(self.path, 'r', encoding='utf-8') as f:
-            cfg = yaml.safe_load(f)
-        # server
-        server = cfg.get("server", {})
-        self.listen_host = server.get("listen_host", '0.0.0.0')
-        self.listen_port = server.get("listen_port", 1081)
-        self.socks_host = server.get("socks_host", '0.0.0.0')
-        self.socks_port = server.get("socks_port", 1080)
-
-        # proxies
-        self.proxies = {}
-        for p in cfg.get("proxies", []):
-            self.proxies[p["name"]] = p
-
-        # proxy groups
-        self.proxy_groups = {}
-        for g in cfg.get("proxy-groups", []):
-            self.proxy_groups[g["name"]] = g
-        # rules
-        self.rules = []
-        for r in cfg.get("rules", []):
-            parts = r.split(",")
-            if len(parts) == 2:
-                self.rules.append((parts[0], parts[1], None))
-            elif len(parts) == 3:
-                self.rules.append((parts[0], parts[1], parts[2]))
-
-    def match(self, target):
-        import ipaddress
-        for rule in self.rules:
-
-            rtype = rule[0]
-            value = rule[1] if len(rule) > 1 else None
-            action = rule[2] if len(rule) > 2 else None
-
-            if rtype == "DOMAIN-SUFFIX" and target.endswith(value):
-                return action
-            if rtype == "DOMAIN-KEYWORD" and value in target:
-                return action
-            if rtype == "IP-CIDR":
-                try:
-                    if ipaddress.ip_address(target) in ipaddress.ip_network(value):
-                        return action
-                except ValueError:
-                    pass
-            if rtype == "FINAL":
-                return value
-        return "DIRECT"  # fallback
-
-    def add_ss_proxy(self, name, ss_url, group_name = 'FREEDOM'):
-        if os.path.exists(self.path):
-            with open(self.path, 'r', encoding='utf-8') as f:
-                cfg = yaml.safe_load(f) or {}
-        else:
-            cfg = {}
-
-        if "proxies" not in cfg:
-            cfg["proxies"] = []
-
-        # 检查是否已存在同名节点
-        for p in cfg["proxies"]:
-            if p["name"] == name:
-                p["url"] = ss_url
-                break
-        else:
-            cfg["proxies"].append({"name": name, "type": "ss", "url": ss_url})
-
-        # 添加到 proxy-group
-        if group_name:
-            if "proxy-groups" not in cfg:
-                cfg["proxy-groups"] = []
-
-            group = next((g for g in cfg["proxy-groups"] if g["name"] == group_name), None)
-            if group:
-                if "proxies" not in group:
-                    group["proxies"] = []
-                if name not in group["proxies"]:
-                    group["proxies"].append(name)
-            else:
-                # 如果组不存在，创建一个 select 类型组
-                cfg["proxy-groups"].append({
-                    "name": group_name,
-                    "type": "select",
-                    "proxies": [name]
-                })
-
-        # 写回 YAML
-        with open(self.path, 'w', encoding='utf-8') as f:
-            yaml.dump(cfg, f, allow_unicode=True)
-
-        GlobalLogger().log(f"Proxy {name} added to {self.path}")
 
 class ProxyServer:
-    def __init__(self, config):
-        self.config = config
-        self.ss = SS(self.config.socks_host, self.config.socks_port)
+    def __init__(self):
+        self.ss = SS(get_config().socks_host, get_config().socks_port)
         
     async def get_host_from_data(self, data, writer):
         """
@@ -182,6 +78,7 @@ class ProxyServer:
             return None
 
         host = None
+        port = None
         for line in header.split("\r\n"):  # 或 "\n"
             if not isinstance(line, str):
                 continue
@@ -233,7 +130,7 @@ class ProxyServer:
                 host, port = host_port.split(":")
                 port = int(port)
 
-                strategy = self.config.match(host)
+                strategy = get_config().match(host)
                 GlobalLogger().log(f"[RULE] {host}:{port} -> {strategy}")
 
                 if strategy.upper() == "PROXY":
@@ -260,7 +157,7 @@ class ProxyServer:
                     GlobalLogger().log(f'host parse err.{data}', 'ERR')
                     return
 
-                strategy = self.config.match(host)
+                strategy = get_config().match(host)
                 GlobalLogger().log(f"[RULE] {host}:{port} -> {strategy}")
 
                 if strategy.upper() == "PROXY":
@@ -356,50 +253,13 @@ class ProxyServer:
 
     async def run(self):
         server = await asyncio.start_server(
-            self.handle_client, self.config.listen_host, self.config.listen_port
+            self.handle_client, get_config().listen_host, get_config().listen_port
         )
-        GlobalLogger().log(f"Proxy running at {self.config.listen_host}:{self.config.listen_port}")
+        GlobalLogger().log(f"Proxy running at {get_config().listen_host}:{get_config().listen_port}")
         async with server:
             await server.serve_forever()
 
 
-class GlobalLogger(QObject):
-    new_log = Signal(str, str, str)  # timestamp, level, message
-
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __init__(self):
-        if hasattr(self, '_initialized') and self._initialized:
-            return
-        super().__init__()
-        self._initialized = True
-
-        # 线程安全队列
-        self._queue = Queue()
-
-        # 定时器刷新队列
-        self._timer = QTimer()
-        self._timer.timeout.connect(self._flush)
-        self._timer.start(200)  # 200ms 刷新一次
-
-    def log(self, message, level='INFO', timestamp=None):
-        if timestamp is None:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 直接放入队列，不发信号
-        self._queue.put((timestamp, level, message))
-
-    def _flush(self):
-        while not self._queue.empty():
-            timestamp, level, message = self._queue.get()
-            self.new_log.emit(timestamp, level, message)
 
 
 class SSLocalLogReader(QObject):
@@ -423,10 +283,10 @@ class SSLocalLogReader(QObject):
             m = re.match(pattern, line)
             if m:
                 timestamp, level, message = m.groups()
-                GlobalLogger().log('ss-local:'+message , level, timestamp)  # 发给全局日志
+                GlobalLogger().log('[ss-local] '+message , level, timestamp)  # 发给全局日志
 
             else:
-                GlobalLogger().log(f"sslocal logreader err: 格式不匹配")
+                GlobalLogger().log(f"[ss-local] logreader err: 格式不匹配")
   
 class SS(QObject):
     def __init__(self, ss_host = '127.0.0.1', ss_port = 1080):
@@ -452,7 +312,7 @@ class SS(QObject):
             "-m", ss_info['method'],        # 加密方式
             "-b", self.proxy_host,              # 本地监听地址
             "-l", str(self.proxy_port),                   # 本地 SOCKS5 端口
-            "-v"                            # verbose
+            # "-v"                            # verbose
         ]
 
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -561,17 +421,18 @@ class NodeTree(QTreeWidget):
         dlg = QRCodeDialog(ss_link)
         dlg.exec()
 
-    def add_node(self, node_name, sub_nodes):
-            # 先找有没有同名顶层父节点
-            parent_items = self.findItems(node_name, Qt.MatchExactly)
-            if parent_items:
-                parent = parent_items[0]
-                self._add_subnodes(parent, sub_nodes)
-            else:
-                parent = QTreeWidgetItem(self, [node_name])
-                self.addTopLevelItem(parent)
-                self._add_subnodes(parent, sub_nodes)
-            parent.setExpanded(True)
+    def add_node(self, parent_node_name, sub_node_data):
+        # 先找有没有同名顶层父节点
+        parent_items = self.findItems(parent_node_name, Qt.MatchExactly)
+        if parent_items:
+            parent = parent_items[0]
+            self._add_subnodes(parent, sub_node_data)
+        else:
+            parent = QTreeWidgetItem(self)
+            parent.setText(0, parent_node_name)
+            self.addTopLevelItem(parent)
+            self._add_subnodes(parent, sub_node_data)
+        parent.setExpanded(True)
 
     def _add_subnodes(self, parent_node, sub_nodes):
         for name, ss_url in sub_nodes:
@@ -582,7 +443,8 @@ class NodeTree(QTreeWidget):
                     exists = True
                     break
             if not exists:
-                child = QTreeWidgetItem(parent_node, [name])
+                child = QTreeWidgetItem(parent_node)
+                child.setText(0, name)
                 child.setData(0, Qt.UserRole, ss_url)
                 parent_node.addChild(child)
 
@@ -592,8 +454,11 @@ class NodeTree(QTreeWidget):
             index = self.indexOfTopLevelItem(item)
             if index != -1:
                 self.takeTopLevelItem(index)
+            get_config().remove_ss_proxy(None, item.text(0))            
+    
         else:
             parent.removeChild(item)
+            get_config().remove_ss_proxy(item.text(0), None)            
 
 class HomePage(QWidget):
     def __init__(self, server):
@@ -622,9 +487,10 @@ class HomePage(QWidget):
         self.load_proxies_to_tree()
     def load_proxies_to_tree(self):
         # 先加载 proxy-groups
-        proxy_groups = self.server.config.proxy_groups
-        proxies = self.server.config.proxies
+        proxy_groups = get_config().proxy_groups
+        proxies = get_config().proxies
         for name, group in proxy_groups.items():
+            self.tree.add_node(name, [])
             for proxy_name in group['proxies']:
                 p = proxies.get(proxy_name)
                 self.tree.add_node(name, [(p['name'], p['url'])])
@@ -643,15 +509,16 @@ class HomePage(QWidget):
                     ss_info = parse_ss_link(sslink)
                     print(ss_info)
                     if ss_info:
-                        self.server.config.add_ss_proxy(ss_info['remark'], sslink)            
+                        get_config().add_ss_proxy(ss_info['remark'], sslink)            
                 self.tree.clear()
                 self.load_proxies_to_tree()
 
             elif url.startswith('ss://'):
-                self.server.config.add_ss_proxy(parse_ss_link(url)['remark'], url)            
+                get_config().add_ss_proxy(parse_ss_link(url)['remark'], url)            
                 self.tree.clear()
                 self.load_proxies_to_tree()
-
+            else:
+                print(f"subscribe err {url}")
 
     def toggle_ssr(self, checked):
         if checked:
@@ -673,16 +540,16 @@ class HomePage(QWidget):
             self.server.ss.close_ss()
             
 class ConfPage(QWidget):
-    def __init__(self, config):
+    def __init__(self):
         super().__init__()
-        self.config = config
 
         layout = QVBoxLayout()
         self.setLayout(layout)
-        self.label = QLabel(f'R/W: {self.config.path}')
+        self.label = QLabel(f'R/W: {get_config_path()}')
         layout.addWidget(self.label)
 
         self.editor = QPlainTextEdit()
+
         self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)  # 禁止自动换行
         self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)  # 出现水平滚动条
         layout.addWidget(self.editor)
@@ -692,10 +559,11 @@ class ConfPage(QWidget):
         layout.addWidget(save_btn)
 
         self.load_conf()
+        get_config().config_changed.connect(self.load_conf)
 
     def load_conf(self):
         try:
-            with open(self.config.path, "r", encoding="utf-8") as f:
+            with open(get_config_path(), "r", encoding="utf-8") as f:
                 content = f.read()
             self.editor.setPlainText(content)
         except Exception as e:
@@ -704,9 +572,10 @@ class ConfPage(QWidget):
     def save_conf(self):
         try:
             content = self.editor.toPlainText()
-            with open(self.config.path, "w", encoding="utf-8") as f:
+            with open(get_config_path(), "w", encoding="utf-8") as f:
                 f.write(content)
             QMessageBox.information(self, "Saved", "Configuration saved successfully!")
+            get_config().config_changed.emit()
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to save config: {e}")
 class LogProxyOptionsWidget(QWidget):
@@ -884,10 +753,9 @@ class SettingPage(QWidget):
         self.setLayout(layout)
 
 class MainWindow(QMainWindow):
-    def __init__(self, theme_manager, config, server):
+    def __init__(self, theme_manager, server):
         super().__init__()
         self.theme_manager = theme_manager
-        self.config = config
         self.server = server
 
         self.setWindowTitle("SSR-like Client")
@@ -906,7 +774,7 @@ class MainWindow(QMainWindow):
         # 堆栈页面
         self.pages = QStackedWidget()
         self.pages.addWidget(HomePage(self.server))
-        self.pages.addWidget(ConfPage(self.config))
+        self.pages.addWidget(ConfPage())
         self.pages.addWidget(DataPage())
         self.pages.addWidget(SettingPage(theme_manager))
 
@@ -934,9 +802,8 @@ if __name__ == "__main__":
     app = QApplication([])
     theme_manager = ThemeManager(app)
     theme_manager.apply_light_theme()  # 初始浅色
-    config = Config()
-    server = ProxyServer(config)
-    window = MainWindow(theme_manager, config, server)
+    server = ProxyServer()
+    window = MainWindow(theme_manager, server)
 
     threading.Thread(target=start_server, daemon=True).start()
     window.resize(800, 600)
