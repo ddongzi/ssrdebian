@@ -1,23 +1,16 @@
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal, QMutex
 import yaml
-from tools import resource_path
+from tools import resource_path, singleton
 from logger import GlobalLogger
 import os
 
 # global_config
+@singleton
 class Config(QObject):
-    _instance = None
     config_changed = Signal()
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
 
     def __init__(self, path="resources/config.yml"):
-        if hasattr(self, '_initialized') and self._initialized:
-            return
         super().__init__()
-        self._initialized = True
 
         self.path = resource_path(path)
         self.load_config()

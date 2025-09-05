@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QListWidget,
     QStackedWidget, QLabel, QHBoxLayout, QPushButton, QComboBox, QMessageBox,
     QLineEdit, QFormLayout, QDialogButtonBox, QDialog, QTreeWidget,
-    QTreeWidgetItem, QCheckBox, QGroupBox, QMenu, QPlainTextEdit, QTextEdit
+    QTreeWidgetItem, QCheckBox, QGroupBox, QMenu, QPlainTextEdit, QTextEdit, QHeaderView
 )
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal, QMutex
 from PySide6.QtGui import QPixmap, QImage, QFont
@@ -12,344 +12,13 @@ from io import BytesIO
 import threading
 import json
 import base64
-import urllib.parse
-import subprocess
-import re
-import requests
+
 from urllib.parse import urlparse
 import asyncio
 from config import get_config, get_config_path
 from logger import GlobalLogger
-from tools import resource_path
-
-# ss://
-# Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo1NzQ1MDJkMS01Y2FlLTQ0ODMtYTQ1Ny03ZmFkMjRmMjg3Y2M
-# @v1abc123.sched.sma-dk.hfifx.xin:40060
-# #%F0%9F%87%AF%F0%9F%87%B5%20JP%20%20%20%20Cappuccino    
-def parse_ss_link(ss_link):
-    # 去掉前缀 ss://
-    ss_link = ss_link[5:]
-
-    # 分割备注
-    parts = ss_link.split("#")
-    main_part = parts[0]
-    remark = urllib.parse.unquote(parts[1]) if len(parts) > 1 else ""
-
-    # 分割 server 和加密信息
-    if "@" in main_part:
-        method_pass_enc, server_part = main_part.split("@")
-    else:
-        # 部分 ss 链接会整体 base64 编码，需要额外处理（这里不展开）
-        return None
-
-    # base64 decode method:password
-    method_pass = base64.urlsafe_b64decode(method_pass_enc + "=" * (-len(method_pass_enc) % 4)).decode()
-    method, password = method_pass.split(":", 1)
-
-    # 分割 host 和 port
-    if ":" in server_part:
-        host, port = server_part.split(":")
-    else:
-        host, port = server_part, ""
-
-    return {
-        "method": method,
-        "password": password,
-        "host": host,
-        "port": port,
-        "remark": remark
-    }
-
-class ProxyServer:
-    def __init__(self):
-        self.ss = SS(get_config().socks_host, get_config().socks_port)
-        
-    async def get_host_from_data(self, data, writer):
-        """
-        安全解析 TCP 流中的 HTTP/HTTPS 请求 Host
-        data: bytes
-        writer: asyncio.StreamWriter，用于在解析失败时关闭连接
-        """
-        try:
-            header = data.decode(errors="ignore")
-        except Exception:
-            writer.close()
-            await writer.wait_closed()
-            return None
-
-        host = None
-        port = None
-        for line in header.split("\r\n"):  # 或 "\n"
-            if not isinstance(line, str):
-                continue
-            line_lower = line.lower()
-            if line_lower.startswith("host:"):
-                # partition 更安全，防止 split 报错
-                host = line.partition(":")[2].strip()
-                # 如果 host 中带端口，例如 host: example.com:8080
-                if ":" in host:
-                    host, port_str = host.split(":", 1)
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        port = 80
-                break
-            # CONNECT 方法特殊处理
-            if line_lower.startswith("connect "):
-                parts = line.split()
-                if len(parts) >= 2:
-                    host_port = parts[1].strip()
-                    if ":" in host_port:
-                        host, port_str = host_port.split(":", 1)
-                        try:
-                            port = int(port_str)
-                        except ValueError:
-                            port = 443
-                    else:
-                        host = host_port
-                        port = 443
-                break
-
-        if not host:
-            writer.close()
-            await writer.wait_closed()
-            return None, None
-
-        return host, port
-
-    async def handle_client(self, reader, writer):
-        try:
-            data = await reader.read(4096)
-            if not data:
-                return
-
-            first_line = data.split(b"\r\n", 1)[0].decode(errors="ignore")
-            if first_line.startswith("CONNECT"):
-                # HTTPS 隧道代理
-                host_port = first_line.split(" ")[1]   # "baidu.com:443"
-                host, port = host_port.split(":")
-                port = int(port)
-
-                strategy = get_config().match(host)
-                GlobalLogger().log(f"[RULE] {host}:{port} -> {strategy}")
-
-                if strategy.upper() == "PROXY":
-                    remote_reader, remote_writer = await self.socks5_connect(
-                            self.ss.proxy_host, self.ss.proxy_port, host, port
-                        )
-                else:  # DIRECT
-                    remote_reader, remote_writer = await asyncio.open_connection(
-                        host, port
-                    )
-
-                # 返回 200 给浏览器，表示隧道建立成功
-                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await writer.drain()
-
-                # 隧道转发
-                asyncio.create_task(self.pipe(reader, remote_writer))
-                asyncio.create_task(self.pipe(remote_reader, writer))
-
-            else:
-                # 普通 HTTP 请求
-                host, port = await self.get_host_from_data(data, writer)
-                if not host:
-                    GlobalLogger().log(f'host parse err.{data}', 'ERR')
-                    return
-
-                strategy = get_config().match(host)
-                GlobalLogger().log(f"[RULE] {host}:{port} -> {strategy}")
-
-                if strategy.upper() == "PROXY":
-                   remote_reader, remote_writer = await self.socks5_connect(
-                            self.ss.proxy_host, self.ss.proxy_port, host, port
-                        )
-                else:  # DIRECT
-                    remote_reader, remote_writer = await asyncio.open_connection(
-                        host, port
-                    )
-
-                # 转发首包
-                remote_writer.write(data)
-                await remote_writer.drain()
-
-                # pipe 双向转发
-                asyncio.create_task(self.pipe(reader, remote_writer))
-                asyncio.create_task(self.pipe(remote_reader, writer))
-
-        except Exception as e:
-            GlobalLogger().log(f"{e}", level='ERR')
-            writer.close()
-    # pipe 双向转发
-    async def pipe(self, r, w):
-        try:
-            while True:
-                buf = await r.read(4096)
-                if not buf:
-                    break
-                w.write(buf)
-                await w.drain()
-        except Exception:
-            pass
-        finally:
-            w.close()
-    async def socks5_connect(self,proxy_host, proxy_port, dest_host, dest_port):
-        """
-        通过 SOCKS5 代理连接目标 host:port
-        返回 (reader, writer)
-        """
-        import struct
-        reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
-
-        # -------------------
-        # 1. 握手
-        # -------------------
-        # 0x05 = SOCKS5, 0x01 = 支持一个认证方法, 0x00 = 不需要认证
-        writer.write(b"\x05\x01\x00")
-        await writer.drain()
-        resp = await reader.readexactly(2)
-        if resp[0] != 0x05 or resp[1] != 0x00:
-            raise RuntimeError("SOCKS5 handshake failed")
-
-        # -------------------
-        # 2. 发送 CONNECT 请求
-        # -------------------
-        dest_ip_bytes = None
-        try:
-            # 尝试解析成 IP
-            import ipaddress
-            ip_obj = ipaddress.ip_address(dest_host)
-            dest_ip_bytes = ip_obj.packed
-            addr_type = 0x01  # IPv4 或 IPv6
-        except:
-            addr_type = 0x03  # domain
-
-        if addr_type == 0x01:
-            # IPv4 或 IPv6
-            writer.write(b"\x05\x01\x00" + bytes([len(dest_ip_bytes)]) + dest_ip_bytes + struct.pack(">H", dest_port))
-        else:
-            # domain
-            host_bytes = dest_host.encode()
-            writer.write(b"\x05\x01\x00" + bytes([addr_type]) + bytes([len(host_bytes)]) + host_bytes + struct.pack(">H", dest_port))
-        await writer.drain()
-
-        # 读取响应
-        # resp: VER(1) REP(1) RSV(1) ATYP(1) BND.ADDR + BND.PORT
-        resp = await reader.read(4)
-        if len(resp) < 4 or resp[1] != 0x00:
-            raise RuntimeError("SOCKS5 connect failed")
-        # 读取剩余 BND.ADDR + BND.PORT
-        if resp[3] == 0x01:
-            await reader.read(4 + 2)
-        elif resp[3] == 0x03:
-            l = await reader.read(1)
-            await reader.read(l[0] + 2)
-        elif resp[3] == 0x04:
-            await reader.read(16 + 2)
-        else:
-            raise RuntimeError("Unknown ATYP")
-
-        return reader, writer
-
-    async def run(self):
-        server = await asyncio.start_server(
-            self.handle_client, get_config().listen_host, get_config().listen_port
-        )
-        GlobalLogger().log(f"Proxy running at {get_config().listen_host}:{get_config().listen_port}")
-        async with server:
-            await server.serve_forever()
-
-
-
-
-class SSLocalLogReader(QObject):
-    def __init__(self, proc):
-        super().__init__()
-        self.proc = proc
-        self._running = True
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        GlobalLogger().log(f'ss local log reader thread start: {threading.get_ident()}')
-        while self._running:
-            line = self.proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            pattern = r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\w+): (.*)$"
-
-            m = re.match(pattern, line)
-            if m:
-                timestamp, level, message = m.groups()
-                GlobalLogger().log('[ss-local] '+message , level, timestamp)  # 发给全局日志
-
-            else:
-                GlobalLogger().log(f"[ss-local] logreader err: 格式不匹配")
-  
-class SS(QObject):
-    def __init__(self, ss_host = '127.0.0.1', ss_port = 1080):
-        super().__init__()
-        self.proc = None
-        self.thread = None
-        self.running = False
-        self.proxy_host = ss_host
-        self.proxy_port = ss_port
-        self.proxies = {
-           "http": f"socks5h://{self.proxy_host}:{self.proxy_port}",
-            "https": f"socks5h://{self.proxy_host}:{self.proxy_port}"
-        }
-
-    def connect_ss(self, ss_link):
-        ss_info = parse_ss_link(ss_link)
-
-        cmd = [
-            "ss-local",
-            "-s", ss_info['host'],          # 服务器 IP
-            "-p", str(ss_info['port']),     # 服务器端口
-            "-k", ss_info['password'],      # 密码
-            "-m", ss_info['method'],        # 加密方式
-            "-b", self.proxy_host,              # 本地监听地址
-            "-l", str(self.proxy_port),                   # 本地 SOCKS5 端口
-            # "-v"                            # verbose
-        ]
-
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        GlobalLogger().log(f"Shadowsocks 启动中... {cmd}")
-        # 创建线程和日志读取器
-        self.thread = QThread()
-        self.log_worker = SSLocalLogReader(self.proc)
-        self.log_worker.moveToThread(self.thread)
-        self.thread.started.connect(self.log_worker.run)
-        self.thread.start()
-        self.running = True
-
-    def close_ss(self):
-        self.running = False
-        if self.proc:
-            self.proc.terminate()
-            self.proc.wait()
-            self.proc = None
-            self.log_worker.stop()
-            if self.thread and self.thread.isRunning():
-                self.thread.quit()    # 让线程退出事件循环
-                self.thread.wait()    # 等待线程退出
-            GlobalLogger().log("Shadowsocks 已停止")
-
-    def get(self, url):
-        try:
-            if self.running:
-                response = requests.get(url=url, proxies=self.proxies, timeout=5)
-            else:
-                response = requests.get(url=url, proxies=None, timeout=5)
-            if response.status_code == 200:
-                return None, response
-            else:
-                return None, response
-        except Exception as e:
-            GlobalLogger().log(f"代理测试异常: {e}")
-            return e, None
+from tools import resource_path, parse_ss_link
+from server import ProxyServer, start_server
 
 class SubscribeInputDialog(QDialog):
     def __init__(self, parent=None):
@@ -398,12 +67,49 @@ class QRCodeDialog(QDialog):
         img.save(buffer, format="PNG")
         qimg = QImage.fromData(buffer.getvalue())
         return QPixmap.fromImage(qimg)
+    
+class NodeTreeItemStatusWidget(QWidget):
+    COLORS = {"online": "green", "offline": "red", "checking": "orange"}
+    latency_changed = Signal(object)
+    def __init__(self, status="checking", latency=None):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.light = QLabel()
+        self.light.setFixedSize(12, 12)
+        layout.addWidget(self.light)
+
+        self.latency_label = QLabel()
+        layout.addWidget(self.latency_label)
+
+        self.latency_changed.connect(self.on_latency_changed)
+
+        self.set_status(status, latency)
+
+    def on_latency_changed(self, latency):
+        self.set_status("online" if latency is not None else "offline", latency)
+
+    def set_status(self, status, latency=None):
+        color = self.COLORS.get(status, "gray")
+        self.light.setStyleSheet(f"background-color: {color}; border-radius: 6px;")
+
+        if latency is not None:
+            self.latency_label.setText(f"{latency} ms")
+        else:
+            self.latency_label.setText("-1 ms")
+
 class NodeTree(QTreeWidget):
     def __init__(self):
         super().__init__()
-        self.setHeaderLabels(["Node"])
+        self.setHeaderLabels(["Node", 'Status'])
+        header = self.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)   # 列 0 占满剩余空间
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 列 1 宽度随内容
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+
     def show_context_menu(self, pos):
         item = self.itemAt(pos)
         if item:
@@ -446,7 +152,8 @@ class NodeTree(QTreeWidget):
                 child = QTreeWidgetItem(parent_node)
                 child.setText(0, name)
                 child.setData(0, Qt.UserRole, ss_url)
-                parent_node.addChild(child)
+                status = NodeTreeItemStatusWidget('checking')
+                self.setItemWidget(child, 1, status)
 
     def delete_node(self, item):
         parent = item.parent()
@@ -458,13 +165,31 @@ class NodeTree(QTreeWidget):
     
         else:
             parent.removeChild(item)
-            get_config().remove_ss_proxy(item.text(0), None)            
+            get_config().remove_ss_proxy(item.text(0), None) 
+    def update_latency(self):
+        for i in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(i)
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                status_widget = self.itemWidget(child, 1)
+                if isinstance(status_widget, NodeTreeItemStatusWidget):
+                    ss_info = parse_ss_link(child.data(0, Qt.UserRole))
+                    latency_future = server.check_latency_sync(ss_info['host'], ss_info['port'])  # 用已运行 server
+
+                    def on_latency_done(fut, widget=status_widget):
+                        try:
+                            latency = fut.result()
+                        except Exception:
+                            latency = None
+                        widget.latency_changed.emit(latency)
+                    latency_future.add_done_callback(on_latency_done)
+
+
 
 class HomePage(QWidget):
-    def __init__(self, server):
+    def __init__(self):
         super().__init__()
         layout = QVBoxLayout()
-        self.server = server
         #        
         self.btn_add_subscribe = QPushButton("+ add subscribe url")
         layout.addWidget(self.btn_add_subscribe)
@@ -476,10 +201,15 @@ class HomePage(QWidget):
         self.btn_ssr_toggle.clicked.connect(self.toggle_ssr)
         layout.addWidget(self.btn_ssr_toggle)
 
+        self.btn_check_latency = QPushButton('check latency')
+        layout.addWidget(self.btn_check_latency)
+
         # 订阅节点树
         layout.addWidget(QLabel("Subscribed Nodes:"))
         self.tree = NodeTree()
         layout.addWidget(self.tree)
+
+        self.btn_check_latency.clicked.connect(self.tree.update_latency)
 
         self.setLayout(layout)
 
@@ -503,11 +233,10 @@ class HomePage(QWidget):
                 GlobalLogger().log(f'will subscribe {url}')
                 if not url:
                     QMessageBox.warning(self, "警告", "订阅 URL 不能为空")
-                e, res = self.server.ss.get(url)
+                e, res = ProxyServer().ss.get(url)
                 sslinks = base64.b64decode(res.text.strip()).decode('utf-8').split('\n')
                 for sslink in sslinks:
                     ss_info = parse_ss_link(sslink)
-                    print(ss_info)
                     if ss_info:
                         get_config().add_ss_proxy(ss_info['remark'], sslink)            
                 self.tree.clear()
@@ -518,7 +247,7 @@ class HomePage(QWidget):
                 self.tree.clear()
                 self.load_proxies_to_tree()
             else:
-                print(f"subscribe err {url}")
+                GlobalLogger().log(f"subscribe err {url}")
 
     def toggle_ssr(self, checked):
         if checked:
@@ -529,7 +258,7 @@ class HomePage(QWidget):
             if selected_item:
                 node_name = selected_item.text(0)                # 节点名称
                 ss_url = selected_item.data(0, Qt.UserRole)      # 绑定的 ss:// 数据（如果有）
-                self.server.ss.connect_ss(ss_url)
+                ProxyServer().ss.connect_ss(ss_url)
             else:
                 GlobalLogger().log("没有选中节点", 'ERR')
 
@@ -537,7 +266,7 @@ class HomePage(QWidget):
             self.btn_ssr_toggle.setText("Start SSR")
             QMessageBox.information(self, "SSR", "SSR stopped")
             # 这里关闭 SSR 逻辑
-            self.server.ss.close_ss()
+            ProxyServer().ss.close_ss()
             
 class ConfPage(QWidget):
     def __init__(self):
@@ -565,9 +294,14 @@ class ConfPage(QWidget):
         try:
             with open(get_config_path(), "r", encoding="utf-8") as f:
                 content = f.read()
+            
+            # 去掉多余回车或换行符
+            content = content.replace("\r", "")
+            
             self.editor.setPlainText(content)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load config: {e}")
+
 
     def save_conf(self):
         try:
@@ -595,7 +329,7 @@ class LogProxyOptionsWidget(QWidget):
 
 class LogWidget(QWidget):
     new_log = Signal(str, str, str)
-    def __init__(self):
+    def __init__(self, max_logs = 500):
         super().__init__()
         layout = QVBoxLayout(self)
 
@@ -604,7 +338,7 @@ class LogWidget(QWidget):
         layout.addWidget(self.log_text)
 
         self.logs = []  # [(timestamp, level, message), ...]
-
+        self.max_logs = max_logs
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_logs)
         self.timer.start(5000)  # 每秒刷新
@@ -614,6 +348,8 @@ class LogWidget(QWidget):
 
     def add_log(self, timestamp, level, message):
         self.logs.append((timestamp, level, message))
+        if len(self.logs) > self.max_logs:
+            self.logs = self.logs[-50:]
 
     def refresh_logs(self):
         # 清空并重新显示（如果日志太多，也可以改为只追加最新几条）
@@ -621,33 +357,53 @@ class LogWidget(QWidget):
         for t, lvl, msg in self.logs:
             self.log_text.appendPlainText(f"[{t}] [{lvl}] {msg}")
 
-class NodeStatsWidget(QWidget):
-    def __init__(self, server):
+class StatsWidget(QWidget):
+    def __init__(self):
         super().__init__()
-        self.server = server  # 你的 SSR/SS 服务对象
-        layout = QVBoxLayout()
-        self.text = QTextEdit()
-        self.text.setReadOnly(True)  # 只读，不允许编辑
-        layout.addWidget(self.text)
-        self.setLayout(layout)
+
+        layout = QVBoxLayout(self)
+
+        self.thread_label = QLabel("Threads: 0")
+        self.host_label = QLabel("Active Hosts: 0")
+        self.speed_label = QLabel("Speed: 0 KB/s")
+        self.total_label = QLabel("Total Traffic: 0 KB")
+
+        layout.addWidget(self.thread_label)
+        layout.addWidget(self.host_label)
+        layout.addWidget(self.speed_label)
+        layout.addWidget(self.total_label)
 
         # 定时刷新
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_stats)
-        self.timer.start(2000)  # 每2秒刷新一次
-
-        self.update_stats()
+        self.timer.start(1000)  # 每秒刷新
 
     def update_stats(self):
-        self.text.clear()
-        nodes = self.server.get_all_nodes_stats()  # 你需要在 server 提供方法返回 list/dict
-        for node in nodes:
-            up = node.get('up_bytes', 0)/1024
-            down = node.get('down_bytes', 0)/1024
-            total = node.get('total_bytes', 0)/1024
-            self.text.append(
-                f"{node['name']}: Up {up:.1f} KB, Down {down:.1f} KB, Total {total:.1f} KB"
-            )
+        # 线程数
+        import threading
+        threads = threading.active_count()
+
+        # 主机数
+        hosts = len(ProxyServer().active_hosts)
+
+        # 流量统计
+        now_rx = ProxyServer().bytes_received
+        now_tx = ProxyServer().bytes_sent
+
+        # 计算速度
+        if not hasattr(self, "_last_rx"):
+            self._last_rx, self._last_tx = now_rx, now_tx
+            speed_rx = speed_tx = 0
+        else:
+            speed_rx = (now_rx - self._last_rx) / 1024  # KB/s
+            speed_tx = (now_tx - self._last_tx) / 1024
+            self._last_rx, self._last_tx = now_rx, now_tx
+
+        # 更新 UI
+        self.thread_label.setText(f"Threads: {threads}")
+        self.host_label.setText(f"Active Hosts: {hosts}")
+        self.speed_label.setText(f"Speed: {speed_rx:.1f} ↓  {speed_tx:.1f} ↑ KB/s")
+        self.total_label.setText(f"Total Traffic: {(now_rx+now_tx)/1024:.1f} KB")
 
 class DataPage(QWidget):
     def __init__(self):
@@ -655,11 +411,9 @@ class DataPage(QWidget):
         layout = QVBoxLayout()
 
         # 统计项
-        stats_label = QLabel("Statistics: TODO")  # 这里你可以换成具体统计控件
-        layout.addWidget(stats_label)
+        layout.addWidget(StatsWidget())
 
         # 日志组
-        logs_label = QLabel("log:")
         layout.addWidget(LogWidget())
 
         self.setLayout(layout)
@@ -736,7 +490,7 @@ class ThemeManager:
             self.apply_light_theme()
 
 class SettingPage(QWidget):
-    def __init__(self, theme_manager, version="1.0.1"):
+    def __init__(self, theme_manager, version="1.0.2"):
         super().__init__()
         self.theme_manager = theme_manager
         layout = QVBoxLayout()
@@ -753,10 +507,9 @@ class SettingPage(QWidget):
         self.setLayout(layout)
 
 class MainWindow(QMainWindow):
-    def __init__(self, theme_manager, server):
+    def __init__(self, theme_manager):
         super().__init__()
         self.theme_manager = theme_manager
-        self.server = server
 
         self.setWindowTitle("SSR-like Client")
 
@@ -773,7 +526,7 @@ class MainWindow(QMainWindow):
 
         # 堆栈页面
         self.pages = QStackedWidget()
-        self.pages.addWidget(HomePage(self.server))
+        self.pages.addWidget(HomePage())
         self.pages.addWidget(ConfPage())
         self.pages.addWidget(DataPage())
         self.pages.addWidget(SettingPage(theme_manager))
@@ -789,23 +542,22 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # 优雅终止子进程
-        self.server.ss.close_ss()
+        ProxyServer().ss.close_ss()
         # 关闭其他资源，如打开的socket、文件等
 
         event.accept()  # 允许窗口关闭
 
-def start_server():
-    GlobalLogger().log(f'proxy server thread start: {threading.get_ident()}')
-    asyncio.run(server.run())
 
 if __name__ == "__main__":
     app = QApplication([])
     theme_manager = ThemeManager(app)
     theme_manager.apply_light_theme()  # 初始浅色
-    server = ProxyServer()
-    window = MainWindow(theme_manager, server)
 
-    threading.Thread(target=start_server, daemon=True).start()
+    window = MainWindow(theme_manager)
     window.resize(800, 600)
     window.show()
+
+    server = ProxyServer()
+    threading.Thread(target=server.start, daemon=True).start()
+
     app.exec()

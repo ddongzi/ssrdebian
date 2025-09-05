@@ -2,25 +2,14 @@ import threading
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal, QMutex
 from datetime import datetime
 from queue import Queue
+from tools import singleton
 
+@singleton
 class GlobalLogger(QObject):
     new_log = Signal(str, str, str)  # timestamp, level, message
 
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
-
     def __init__(self):
-        if hasattr(self, '_initialized') and self._initialized:
-            return
         super().__init__()
-        self._initialized = True
 
         # 线程安全队列
         self._queue = Queue()
